@@ -16,7 +16,7 @@ type Server struct {
     clientId  uint64
     sessions  map[uint64]*AcceptClient
     OnNew     func(id uint64)
-    OnData    func(tag uint32, payload []byte)
+    OnData    func(id uint64, tag uint32, payload []byte)
     OnClose   func(id uint64)
 }
 type AcceptClient struct {
@@ -120,7 +120,7 @@ func (s *Server) handleConn(conn *kcp.UDPSession) {
             continue
         }
         // on message
-        s.OnData(tag, payload)
+        s.OnData(id, tag, payload)
     }
 }
 
