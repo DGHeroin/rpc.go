@@ -150,8 +150,9 @@ func (s *Server) handleConn(conn net.Conn) {
 
 func (s *Server) Send(id uint64, tag uint32, data []byte) (n int, err error) {
     s.mutex.RLock()
-    defer s.mutex.RUnlock()
-    if cli, ok := s.sessions[id]; ok {
+    cli, ok := s.sessions[id]
+    s.mutex.RUnlock()
+    if ok {
         return writeMessage(cli.conn, MessageTypeData, tag, data)
     }
     return 0, ErrorConnectIdInvalid
