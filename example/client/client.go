@@ -1,9 +1,11 @@
 package main
 
 import (
-	"github.com/DGHeroin/rpc.go"
-	log "github.com/sirupsen/logrus"
+	"fmt"
+	"log"
 	"time"
+
+	"github.com/DGHeroin/rpc.go"
 )
 
 func main()  {
@@ -21,10 +23,9 @@ func runClient() {
 	cli.OnConnected = func() {
 		//log.Println("connected")
 		isConnected = true
-
 	}
-	cli.OnData = func(tag uint32, data []byte) {
-		//log.Println("收到消息", tag, string(data))
+	cli.OnData = func(message *rpc.Message) {
+		log.Println("收到消息", message.Tag, string(message.Payload))
 	}
 	cli.OnClose	= func() {
 		//log.Println("连接关闭")
@@ -35,8 +36,10 @@ func runClient() {
 	go func() {
 		for {
 			if isConnected {
-				cli.Send(123, []byte("hello world!"))
-				time.Sleep(time.Microsecond)
+				cli.Send(123, []byte("hello world!"), func(message *rpc.Message) {
+					fmt.Println("收到回复:", message.Tag, string(message.Payload))
+				})
+				time.Sleep(time.Second)
 			} else {
 				time.Sleep(time.Second)
 			}

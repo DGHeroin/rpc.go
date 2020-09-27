@@ -11,14 +11,18 @@ import (
 )
 
 type Server struct {
-    address string
-    mutex   sync.RWMutex
-    //ln      net.Listener
-    clientId  uint64
-    sessions  map[uint64]*AcceptClient
-    OnNew     func(id uint64)
-    OnData    func(id uint64, tag uint32, payload []byte)
-    OnClose   func(id uint64)
+    address      string
+    mutex        sync.RWMutex
+    ReadTimeout  time.Duration
+    WriteTimeout time.Duration
+    clientId     uint64
+    sessions     map[uint64]*AcceptClient
+    OnNew        func(id uint64)
+    OnData       func(id uint64, message *Message)
+    OnClose      func(id uint64)
+    requestId    uint32
+    requestMutex sync.Mutex
+    requestMap   map[uint32]func(*Message)
 }
 type AcceptClient struct {
     conn     net.Conn
@@ -27,15 +31,19 @@ type AcceptClient struct {
 
 // 创建服务器
 func NewServer() (*Server, error) {
-    s := &Server{}
+    s := &Server{
+        ReadTimeout:  time.Second * 10,
+        WriteTimeout: time.Second * 10,
+        requestMap:   make(map[uint32]func(*Message)),
+    }
     s.sessions = make(map[uint64]*AcceptClient)
     return s, nil
 }
 
 func (s *Server) Serve(address string, password []byte, salt []byte) error {
     var (
-        ln net.Listener
-        err error
+        ln          net.Listener
+        err         error
         withOptions = false
         kcpListener *kcp.Listener
     )
@@ -83,7 +91,7 @@ func (s *Server) Serve(address string, password []byte, salt []byte) error {
     for isRunning {
         var (
             conn net.Conn
-            err error
+            err  error
         )
         if withOptions {
             conn, err = kcpListener.AcceptKCP()
@@ -108,7 +116,7 @@ func (s *Server) addClient(conn net.Conn) (uint64, *AcceptClient) {
         id = s.clientId
         if _, ok := s.sessions[id]; !ok {
             ac = &AcceptClient{
-                conn: conn,
+                conn:     conn,
                 lastSeen: time.Now(),
             }
             s.sessions[id] = ac
@@ -133,27 +141,67 @@ func (s *Server) handleConn(conn net.Conn) {
     defer s.removeClient(id)
     // on new conn
     for {
-        _, tag, payload, err := readMessage(conn)
+        conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
+        msg, err := readMessage(conn)
         if err != nil {
-            //log.Println("server read message error", err)
             break
         }
         cli.lastSeen = time.Now()
-        if payload == nil {
-            continue
+        if msg != nil {
+            switch msg.Type {
+            case MessageTypeData:
+                // on message
+                s.OnData(id, msg)
+            case MessageTypeReply:
+                // on reply
+                s.requestMutex.Lock()
+                cb, ok := s.requestMap[msg.requestId]
+                if ok {
+                    delete(s.requestMap, msg.requestId)
+                }
+                s.requestMutex.Unlock()
+                if ok {
+                    cb(msg)
+                }
+            }
         }
-        // on message
-        s.OnData(id, tag, payload)
     }
 
 }
 
-func (s *Server) Send(id uint64, tag uint32, data []byte) (n int, err error) {
+func (s *Server) Send(id uint64, tag uint32, data []byte, cb func(*Message)) (n int, err error) {
     s.mutex.RLock()
     cli, ok := s.sessions[id]
     s.mutex.RUnlock()
     if ok {
-        return writeMessage(cli.conn, MessageTypeData, tag, data)
+        go func() {
+            cli.conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
+            _, err := writeMessage(cli.conn, &Message{
+                Type:      MessageTypeData,
+                requestId: s.NextRequestId(cb),
+                Payload:   data,
+                Tag:       tag,
+            })
+            if err != nil {
+                s.removeClient(id)
+            }
+        }()
     }
-    return 0, ErrorConnectIdInvalid
+    return 0, nil
+}
+
+func (s *Server) NextRequestId(cb func(*Message)) uint32 {
+    if cb == nil {
+        return 0
+    }
+    for {
+        s.requestMutex.Lock()
+        _, ok := s.requestMap[s.requestId]
+        s.requestMutex.Unlock()
+        if !ok {
+            s.requestMap[s.requestId] = cb
+            return s.requestId
+        }
+        s.requestId++
+    }
 }

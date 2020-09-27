@@ -1,6 +1,7 @@
 package rpc
 
 import (
+    "bytes"
     "encoding/binary"
     "errors"
     "io"
@@ -11,57 +12,96 @@ var (
     ErrorConnectIdInvalid     = errors.New("connect id invalid")
     ErrorConnectionInvalid    = errors.New("connection invalid")
 )
+
 type MessageType uint8
+
 const (
-    MessageTypeData = MessageType(iota)
-    MessageTypePing
-    MessageTypePong
+    MessageTypeKeep  = MessageType(1)
+    MessageTypeData  = MessageType(2)
+    MessageTypeReply = MessageType(3)
 )
 
-func readMessage(conn io.ReadWriter) (MessageType, uint32, []byte, error) {
-    // read header
-    header := make([]byte, 5)
-    if _, err := io.ReadFull(conn, header); err != nil {
-        return 0, 0, nil, err
-    }
-
-    msgType := MessageType(header[0])
-    size := binary.BigEndian.Uint32(header[1:])
-
-    switch msgType {
-    case MessageTypeData: // data
-        tagBytes := make([]byte, 4)
-        if _, err := io.ReadFull(conn, tagBytes); err != nil {
-            return msgType, 0, nil, err
-        }
-        tag := binary.BigEndian.Uint32(tagBytes)
-        payload := make([]byte, size)
-        if _, err := io.ReadFull(conn, payload); err != nil {
-            return msgType, 0, nil, err
-        }
-        return msgType, tag, payload, nil
-    case MessageTypePing: // ping
-        // response pong
-        writeMessage(conn, 2, 0, nil)
-        return msgType, 0, nil, nil
-    case MessageTypePong: // pong
-        return msgType, 0,nil, nil
-    default:
-        // error
-        return msgType, 0, nil, ErrorMessageFormatInvalid
-    }
+type Message struct {
+    Type      MessageType
+    Payload   []byte
+    Tag       uint32
+    requestId uint32
+    conn      io.Writer
 }
 
-
-func writeMessage(conn io.ReadWriter, msgType MessageType, tag uint32, data []byte) (n int, err error) {
-    header := make([]byte, 5)
-    header[0] = uint8(msgType)
-    binary.BigEndian.PutUint32(header[1:], uint32(len(data)))
-    if msgType == MessageTypeData {
-        tagBytes := make([]byte, 4)
-        binary.BigEndian.PutUint32(tagBytes, tag)
-        header = append(header, tagBytes...)
+func (m *Message) Reply(tag uint32, payload []byte) {
+    go writeMessage(m.conn, &Message{
+        Type:      MessageTypeReply,
+        requestId: m.requestId,
+        Tag:       tag,
+        Payload:   payload,
+    })
+}
+func readUInt32(c io.Reader) (uint32, error) {
+    data := make([]byte, 4)
+    if _, err := io.ReadFull(c, data); err != nil {
+        return 0, err
     }
-    headerAndPayload := append(header, data...)
-    return conn.Write(headerAndPayload)
+    return binary.BigEndian.Uint32(data), nil
+}
+func writeUInt32(val uint32, buffer *bytes.Buffer) {
+    data := make([]byte, 4)
+    binary.BigEndian.PutUint32(data, val)
+    buffer.Write(data)
+}
+func readMessage(conn io.ReadWriter) (*Message, error) {
+    message := &Message{
+        conn: conn,
+    }
+    // read header
+    header := make([]byte, 1)
+    if _, err := io.ReadFull(conn, header); err != nil {
+        return nil, err
+    }
+    msgType := MessageType(header[0])
+
+    if msgType == MessageTypeKeep {
+        return nil, nil
+    }
+    // msg type
+    message.Type = msgType
+    // size
+    size, err := readUInt32(conn)
+    if err != nil {
+        return nil, err
+    }
+    // tag
+    tag, err := readUInt32(conn)
+    if err != nil {
+        return nil, err
+    }
+    // request id
+    requestId, err := readUInt32(conn)
+    if err != nil {
+        return nil, err
+    }
+    // payload
+    payload := make([]byte, size)
+    if _, err := io.ReadFull(conn, payload); err != nil {
+        return nil, err
+    }
+    message.requestId = requestId
+    message.Type = msgType
+    message.Tag = tag
+    message.Payload = payload
+    return message, nil
+
+}
+
+func writeMessage(conn io.Writer, message *Message) (n int, err error) {
+    buffer := bytes.NewBuffer([]byte{uint8(message.Type)}) // msg type
+    if message.Type == MessageTypeKeep {
+    } else {
+        writeUInt32(uint32(len(message.Payload)), buffer) // size
+        writeUInt32(message.Tag, buffer)                  // tag
+        writeUInt32(message.requestId, buffer)            // request id
+        buffer.Write(message.Payload)
+    }
+
+    return conn.Write(buffer.Bytes())
 }
