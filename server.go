@@ -1,110 +1,68 @@
 package rpc
 
 import (
-    "crypto/sha1"
     "net"
     "sync"
     "time"
-
-    "github.com/xtaci/kcp-go"
-    "golang.org/x/crypto/pbkdf2"
 )
 
-type Server struct {
-    address      string
-    mutex        sync.RWMutex
-    ReadTimeout  time.Duration
-    WriteTimeout time.Duration
-    clientId     uint64
-    sessions     map[uint64]*AcceptClient
-    OnNew        func(id uint64)
-    OnData       func(id uint64, message *Message)
-    OnClose      func(id uint64)
-    requestId    uint32
-    requestMutex sync.Mutex
-    requestMap   map[uint32]func(*Message)
-}
-type AcceptClient struct {
-    conn     net.Conn
-    lastSeen time.Time
-}
+type (
+    Server struct {
+        address         string
+        mutex           sync.RWMutex
+        clientId        uint64
+        sessions        map[uint64]*AcceptClient
+        requestManager  *RequestManager
+        option          ServerOption
+        pluginContainer PluginContainer
+    }
+    AcceptClient struct {
+        conn net.Conn
+    }
+
+    ServerOption struct {
+        ReadTimeout  time.Duration
+        WriteTimeout time.Duration
+    }
+)
 
 // 创建服务器
-func NewServer() (*Server, error) {
+func NewServer(opt *ServerOption) (*Server, error) {
+    if opt == nil {
+        opt = defaultServerOption()
+    }
     s := &Server{
-        ReadTimeout:  time.Second * 10,
-        WriteTimeout: time.Second * 10,
-        requestMap:   make(map[uint32]func(*Message)),
+        option:         *opt,
+        requestManager: newRequestManager(),
     }
     s.sessions = make(map[uint64]*AcceptClient)
     return s, nil
 }
 
-func (s *Server) Serve(address string, password []byte, salt []byte) error {
-    var (
-        ln          net.Listener
-        err         error
-        withOptions = false
-        kcpListener *kcp.Listener
-    )
-
-    if password != nil && salt != nil {
-        key := pbkdf2.Key(password, salt, 1024, 32, sha1.New)
-        block, err := kcp.NewAESBlockCrypt(key)
-        if err != nil {
-            return err
-        }
-        kcpListener, err = kcp.ListenWithOptions(address, block, 10, 3)
-        ln = kcpListener
-        withOptions = true
-    } else {
-        ln, err = kcp.Listen(address)
+func defaultServerOption() *ServerOption {
+    return &ServerOption{
     }
-    if err != nil {
-        return err
-    }
-    //s.ln = ln
-    s.address = address
-    isRunning := true
-    ticker := time.NewTicker(time.Second * 3)
-    defer func() {
-        ticker.Stop()
-    }()
-    // monitor
-    go func() {
-        for isRunning {
-            <-ticker.C
-            var deleteList []uint64
-            s.mutex.RLock()
-            for id, cli := range s.sessions {
-                if time.Now().Sub(cli.lastSeen) > time.Second*10 {
-                    deleteList = append(deleteList, id)
-                }
-            }
-            s.mutex.RUnlock()
-            for _, id := range deleteList {
-                s.removeClient(id)
-            }
-        }
-    }()
-
-    for isRunning {
+}
+func (s *Server) AddPlugin(p interface{}) {
+    s.pluginContainer.Add(p)
+}
+func (s *Server) RemovePlugin(p interface{}) {
+    s.pluginContainer.Remove(p)
+}
+func (s *Server) Serve(ln net.Listener) error {
+    for {
         var (
             conn net.Conn
             err  error
         )
-        if withOptions {
-            conn, err = kcpListener.AcceptKCP()
-        } else {
-            conn, err = ln.Accept()
-        }
+
+        conn, err = ln.Accept()
+
         if err != nil {
-            isRunning = false
             return err
         }
         go s.handleConn(conn)
     }
-    return nil
 }
 func (s *Server) addClient(conn net.Conn) (uint64, *AcceptClient) {
     s.mutex.Lock()
@@ -116,8 +74,7 @@ func (s *Server) addClient(conn net.Conn) (uint64, *AcceptClient) {
         id = s.clientId
         if _, ok := s.sessions[id]; !ok {
             ac = &AcceptClient{
-                conn:     conn,
-                lastSeen: time.Now(),
+                conn: conn,
             }
             s.sessions[id] = ac
             break
@@ -125,7 +82,11 @@ func (s *Server) addClient(conn net.Conn) (uint64, *AcceptClient) {
         s.clientId++
     }
     s.mutex.Unlock()
-    s.OnNew(id)
+    s.pluginContainer.Range(func(i interface{}) {
+        if p, ok := i.(ServerOnAcceptPlugin); ok {
+            p.OnAccept(id)
+        }
+    })
     return id, ac
 }
 func (s *Server) removeClient(id uint64) {
@@ -133,75 +94,104 @@ func (s *Server) removeClient(id uint64) {
     defer s.mutex.Unlock()
     if _, ok := s.sessions[id]; ok {
         delete(s.sessions, id)
-        s.OnClose(id)
+        s.pluginContainer.Range(func(i interface{}) {
+            if p, ok := i.(ServerOnClosePlugin); ok {
+                p.OnClose(id)
+            }
+        })
     }
 }
 func (s *Server) handleConn(conn net.Conn) {
-    id, cli := s.addClient(conn)
+    id, _ := s.addClient(conn)
     defer s.removeClient(id)
     // on new conn
     for {
-        conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
+        if s.option.ReadTimeout != 0 {
+            if err := conn.SetReadDeadline(time.Now().Add(s.option.ReadTimeout)); err != nil {
+                break
+            }
+        }
         msg, err := readMessage(conn)
         if err != nil {
             break
         }
-        cli.lastSeen = time.Now()
         if msg != nil {
             switch msg.Type {
-            case MessageTypeData:
+            case MessageTypeRequest, MessageTypeOneWay:
                 // on message
-                s.OnData(id, msg)
-            case MessageTypeReply:
+                s.pluginContainer.Range(func(i interface{}) {
+                    if p, ok := i.(ServerOnMessagePlugin); ok {
+                        p.OnMessage(id, msg)
+                    }
+                })
+                FreeMessage(msg)
+            case MessageTypeResponse:
                 // on reply
-                s.requestMutex.Lock()
-                cb, ok := s.requestMap[msg.requestId]
-                if ok {
-                    delete(s.requestMap, msg.requestId)
-                }
-                s.requestMutex.Unlock()
-                if ok {
-                    cb(msg)
-                }
+                s.requestManager.OnReply(msg)
+                FreeMessage(msg)
             }
         }
     }
 
 }
 
-func (s *Server) Send(id uint64, tag uint32, data []byte, cb func(*Message)) (n int, err error) {
+func (s *Server) Request(id uint64, tag uint32, data []byte, cb func(*Message)) (n int, err error) {
     s.mutex.RLock()
     cli, ok := s.sessions[id]
     s.mutex.RUnlock()
-    if ok {
-        go func() {
-            cli.conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
-            _, err := writeMessage(cli.conn, &Message{
-                Type:      MessageTypeData,
-                requestId: s.NextRequestId(cb),
-                Payload:   data,
-                Tag:       tag,
-            })
-            if err != nil {
-                s.removeClient(id)
-            }
-        }()
+    if !ok {
+        return 0, nil
     }
+    if s.option.WriteTimeout!=0{
+        if err = cli.conn.SetWriteDeadline(time.Now().Add(s.option.WriteTimeout)); err != nil {
+            return -1, err
+        }
+    }
+
+    msg := NewMessage()
+    msg.Type = MessageTypeRequest
+    msg.requestId = s.requestManager.NextRequestId(cb)
+    msg.Payload = data
+    msg.Tag = tag
+    if _, err = writeMessage(cli.conn, msg); err != nil {
+        s.removeClient(id)
+    }
+
     return 0, nil
 }
 
-func (s *Server) NextRequestId(cb func(*Message)) uint32 {
-    if cb == nil {
-        return 0
+func (s *Server) Push(id uint64, tag uint32, data []byte, cb func(*Message)) (n int, err error) {
+    s.mutex.RLock()
+    cli, ok := s.sessions[id]
+    s.mutex.RUnlock()
+    if !ok {
+        return 0, nil
     }
-    for {
-        s.requestMutex.Lock()
-        _, ok := s.requestMap[s.requestId]
-        s.requestMutex.Unlock()
-        if !ok {
-            s.requestMap[s.requestId] = cb
-            return s.requestId
+    if s.option.WriteTimeout!=0{
+        if err = cli.conn.SetWriteDeadline(time.Now().Add(s.option.WriteTimeout)); err != nil {
+            return -1, err
         }
-        s.requestId++
     }
+
+    msg := NewMessage()
+    msg.Type = MessageTypeOneWay
+    msg.requestId = 0
+    msg.Payload = data
+    msg.Tag = tag
+    if _, err = writeMessage(cli.conn, msg); err != nil {
+        s.removeClient(id)
+    }
+    return 0, nil
+}
+func (c *Server) setReadTimeout(conn net.Conn) error {
+    if c.option.ReadTimeout != 0 {
+        return nil
+    }
+    return conn.SetReadDeadline(time.Now().Add(c.option.ReadTimeout))
+}
+func (c *Server) setWriteTimeout(conn net.Conn) error {
+    if c.option.WriteTimeout != 0 {
+        return nil
+    }
+    return conn.SetWriteDeadline(time.Now().Add(c.option.WriteTimeout))
 }

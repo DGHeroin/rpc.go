@@ -1,186 +1,192 @@
 package rpc
 
 import (
-    "crypto/sha1"
     "net"
     "sync"
     "time"
-
-    "github.com/xtaci/kcp-go"
-    "golang.org/x/crypto/pbkdf2"
 )
 
-type Client struct {
-    address      string
-    conn         net.Conn
-    ReadTimeout  time.Duration
-    WriteTimeout time.Duration
-    password     []byte
-    salt         []byte
-    exitChan     chan bool
-    OnConnected  func()
-    OnClose      func()
-    OnData       func(message *Message)
-    sendMutex    sync.Mutex
-    requestMutex sync.Mutex
-    requestId    uint32
-    requestMap   map[uint32]func(*Message)
-}
+type (
+    Client struct {
+        conn            net.Conn
+        option          ClientOption
+        exitChan        chan bool
+        requestManager  *RequestManager
+        pluginContainer PluginContainer
+        listM           sync.Mutex
+        sendList        []*Message
+        lastFlushSend   time.Time
+    }
+    ClientOption struct {
+        ReadTimeout   time.Duration
+        WriteTimeout  time.Duration
+        FlushDuration time.Duration
+    }
+)
 
-func NewClient() (*Client, error) {
+func NewClient(opt *ClientOption) (*Client, error) {
+    if opt == nil {
+        opt = defaultClientOption()
+    }
     cli := &Client{
-        exitChan:     make(chan bool),
-        ReadTimeout:  time.Second * 10,
-        WriteTimeout: time.Second * 10,
-        requestMap:   make(map[uint32]func(*Message)),
+        exitChan:       make(chan bool),
+        option:         *opt,
+        requestManager: newRequestManager(),
     }
     return cli, nil
 }
 
-func (c *Client) DialAndServe(address string, password []byte, salt []byte) error {
-    var (
-        conn net.Conn
-        err  error
-    )
-    if password != nil && salt != nil {
-        key := pbkdf2.Key(password, salt, 1024, 32, sha1.New)
-        block, err := kcp.NewAESBlockCrypt(key)
-        if err != nil {
-            return err
-        }
-        conn, err = kcp.DialWithOptions(address, block, 10, 3)
-    } else {
-        conn, err = kcp.Dial(address)
+func defaultClientOption() *ClientOption {
+    return &ClientOption{
+        //FlushDuration: time.Millisecond * 100,
     }
-    if err != nil {
-        return err
-    }
-    c.address = address
-    c.password = password
-    c.salt = salt
+}
+func (s *Client) AddPlugin(p interface{}) {
+    s.pluginContainer.Add(p)
+}
+func (s *Client) RemovePlugin(p interface{}) {
+    s.pluginContainer.Remove(p)
+}
+func (c *Client) DialAndServe(conn net.Conn) error {
     c.conn = conn
-
-    c.OnConnected()
-    ticker := time.NewTicker(time.Second * 3)
-    isRunning := true
-    lastSeen := time.Now()
-    defer func() {
-        isRunning = false
-        ticker.Stop()
-        c.exitChan = nil
-        c.OnClose()
-        conn.Close()
-    }()
-
-    // monitor
-    go func() {
-        for isRunning {
-            select {
-            case <-ticker.C:
-                c.sendKeepAlive()
-                if isRunning == false {
-                    return
-                }
-                if time.Now().Sub(lastSeen) > time.Second*10 {
-                    isRunning = false
-                    c.exitChan <- true
-                    c.Close()
-                    return
-                }
-            }
+    c.pluginContainer.Range(func(i interface{}) {
+        if p, ok := i.(ClientOnOpenPlugin); ok {
+            p.OnOpen()
         }
+    })
+    defer func() {
+        go close(c.exitChan)
+        c.pluginContainer.Range(func(i interface{}) {
+            if p, ok := i.(ClientOnClosePlugin); ok {
+                p.OnClose()
+            }
+        })
+        _ = conn.Close()
     }()
 
-    for isRunning {
+    for {
         select {
         case <-c.exitChan:
             return nil
         default:
-            _ = conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
+            if err := c.setReadTimeout(); err != nil {
+                return err
+            }
             msg, err := readMessage(conn)
             if err != nil {
                 return err
             }
-            lastSeen = time.Now()
             if msg != nil {
                 switch msg.Type {
-                case MessageTypeData:
+                case MessageTypeRequest, MessageTypeOneWay:
                     // on message
-                    c.OnData(msg)
-                case MessageTypeReply:
+                    c.pluginContainer.Range(func(i interface{}) {
+                        if p, ok := i.(ClientOnMessagePlugin); ok {
+                            p.OnMessage(msg)
+                        }
+                    })
+                    FreeMessage(msg)
+                case MessageTypeResponse:
                     // on reply
                     c.OnReply(msg)
+                    FreeMessage(msg)
                 }
             }
         }
     }
-    return nil
 }
-func (c *Client)OnReply(msg *Message)  {
-    c.requestMutex.Lock()
-    defer c.requestMutex.Unlock()
-    cb, ok := c.requestMap[msg.requestId]
-    if ok {
-        delete(c.requestMap, msg.requestId)
-    }
+func (c *Client) OnReply(msg *Message) {
+    c.requestManager.OnReply(msg)
 
-    if ok {
-        cb(msg)
-    }
 }
 func (c *Client) Close() {
-    if c.exitChan != nil {
-        c.exitChan <- true
-    }
+    close(c.exitChan)
 }
 
-func (c *Client) Send(tag uint32, data []byte, cb func(*Message)) (err error) {
-    c.sendMutex.Lock()
-    defer c.sendMutex.Unlock()
+func (c *Client) Request(tag uint32, data []byte, cb func(*Message)) (err error) {
     if c.conn == nil {
         return ErrorConnectionInvalid
     }
-    c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
-    go writeMessage(c.conn, &Message{
-        Type:      MessageTypeData,
-        requestId: c.NextRequestId(cb),
-        Tag:       tag,
-        Payload:   data,
-    })
+
+    msg := NewMessage()
+    msg.Type = MessageTypeRequest
+    msg.requestId = c.requestManager.NextRequestId(cb)
+    msg.Tag = tag
+    msg.Payload = data
+    return c.postMessage(msg)
+}
+
+func (c *Client) flushSendList() error {
+    c.listM.Lock()
+
+    c.lastFlushSend = time.Now()
+    oldList := c.sendList
+    c.sendList = []*Message{}
+    c.listM.Unlock()
+
+    if err := c.setWriteTimeout(); err != nil {
+        return err
+    }
+    if _, err := writeMessage(c.conn, oldList...); err != nil {
+        return err
+    }
     return nil
 }
 
-func (c *Client) sendKeepAlive() {
-    c.sendMutex.Lock()
-    defer c.sendMutex.Unlock()
+func (c *Client) Push(tag uint32, data []byte, cb func(*Message)) (err error) {
     if c.conn == nil {
-        return
+        return ErrorConnectionInvalid
     }
-    c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
-    go writeMessage(c.conn, &Message{Type: MessageTypeKeep})
+    msg := NewMessage()
+    msg.Type = MessageTypeOneWay
+    msg.requestId = 0
+    msg.Tag = tag
+    msg.Payload = data
+    return c.postMessage(msg)
+}
+
+func (c *Client) sendKeepAlive() error {
+    if c.conn == nil {
+        return nil
+    }
+
+    msg := NewMessage()
+    msg.Type = MessageTypeKeep
+    return c.postMessage(msg)
 }
 
 func (c *Client) Reconnect(second time.Duration) {
     time.AfterFunc(second, func() {
-        c.DialAndServe(c.address, c.password, c.salt)
+        //c.DialAndServe(c.address, c.password, c.salt)
     })
 }
+func (c *Client) postMessage(msg *Message) error {
+    if c.option.FlushDuration == 0 {
+        if err := c.setWriteTimeout(); err != nil {
+            return err
+        }
+        _, err := writeMessage(c.conn, msg)
+        return err
+    }
 
-func (c *Client) NextRequestId(cb func(*Message)) uint32 {
-    if cb == nil {
-        return 0
+    c.listM.Lock()
+    c.sendList = append(c.sendList, msg)
+    c.listM.Unlock()
+    if time.Now().Sub(c.lastFlushSend) >= c.option.FlushDuration {
+        return c.flushSendList()
     }
-    for {
-        if c.requestId == 0 {
-            c.requestId++
-        }
-        c.requestMutex.Lock()
-        _, ok := c.requestMap[c.requestId]
-        c.requestMutex.Unlock()
-        if !ok {
-            c.requestMap[c.requestId] = cb
-            return c.requestId
-        }
-        c.requestId++
+    return nil
+
+}
+func (c *Client) setReadTimeout() error {
+    if c.option.ReadTimeout == 0 {
+        return nil
     }
+    return c.conn.SetReadDeadline(time.Now().Add(c.option.ReadTimeout))
+}
+func (c *Client) setWriteTimeout() error {
+    if c.option.WriteTimeout == 0 {
+        return nil
+    }
+    return c.conn.SetWriteDeadline(time.Now().Add(c.option.WriteTimeout))
 }
