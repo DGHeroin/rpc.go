@@ -1,6 +1,8 @@
 package main
 
 import (
+    "encoding/binary"
+    "fmt"
     "github.com/DGHeroin/rpc.go/kcp"
     "log"
     "sync/atomic"
@@ -17,48 +19,45 @@ func main() {
 }
 
 type clientHandler struct {
-
 }
 
 func (h *clientHandler) OnOpen() {
+    log.Println("open..")
     isConnected = true
 }
 
-func (h *clientHandler) OnMessage( message *rpc.Message) {
+func (h *clientHandler) OnMessage(message *rpc.Message) {
 
 }
 
 func (h *clientHandler) OnClose() {
-
+    isConnected = false
 }
+
 var (
     isConnected = false
 )
 
 func runClient() {
     var qps uint32
-    cli, _ := rpc.NewClient( nil)
+    cli, _ := rpc.NewClient(&rpc.ClientOption{
+        ReadTimeout:  time.Second * 10,
+        WriteTimeout: time.Second * 10,
+    })
     cli.AddPlugin(&clientHandler{})
+    fmt.Println("start...")
     go func() {
         for {
             if isConnected {
-                atomic.AddUint32(&qps, 1)
-                cli.Request(123, []byte("hello world!"), func(message *rpc.Message) {
-                    //fmt.Println("收到回复:", message.Tag, string(message.Payload))
+                n := atomic.AddUint32(&qps, 1)
+                data := make([]byte, 4)
+                binary.BigEndian.PutUint32(data, n)
+                err := cli.Request(data, func(message *rpc.Message) {
+                    fmt.Println("收到回复:", message.Payload)
                 })
-            } else {
-                time.Sleep(time.Second)
-            }
-        }
-    }()
-
-    go func() {
-        for {
-            if isConnected {
-                atomic.AddUint32(&qps, 1)
-                cli.Request(123, []byte("hello world!"), func(message *rpc.Message) {
-                    //fmt.Println("收到回复:", message.Tag, string(message.Payload))
-                })
+                if err != nil {
+                    log.Println("err", err)
+                }
             } else {
                 time.Sleep(time.Second)
             }
@@ -68,13 +67,15 @@ func runClient() {
     go func() {
         for {
             time.Sleep(time.Second)
-            n:=atomic.LoadUint32(&qps)
+            n := atomic.LoadUint32(&qps)
             atomic.StoreUint32(&qps, 0)
-            log.Println("qps:", n)
+            if n != 0 {
+                log.Println("qps:", n)
+            }
         }
     }()
     conn, _ := kcp.NewKCPDialer("127.0.0.1:12345", nil, nil)
-    if err := cli.DialAndServe(conn); err != nil {
+    if err := cli.Serve(conn); err != nil {
         log.Println("初始化出错", err)
         return
     }

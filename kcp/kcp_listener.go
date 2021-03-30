@@ -15,7 +15,6 @@ func NewKCPListenerServe(address string, password []byte, salt []byte) (net.List
             return nil, err
         }
         return kcp.ListenWithOptions(address, block, 10, 3)
-
     } else {
         return kcp.Listen(address)
     }

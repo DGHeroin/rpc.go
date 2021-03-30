@@ -8,11 +8,12 @@ import (
 
     "github.com/DGHeroin/rpc.go"
 )
+
 var (
     qps uint32
 )
-type serverHandler struct {
 
+type serverHandler struct {
 }
 
 func (h *serverHandler) OnAccept(id uint64) {
@@ -21,21 +22,28 @@ func (h *serverHandler) OnAccept(id uint64) {
 
 func (h *serverHandler) OnMessage(id uint64, message *rpc.Message) {
     atomic.AddUint32(&qps, 1)
-    message.Reply(133, []byte("hello world"))
+    err := message.Reply(message.Payload)
+    if err != nil {
+        log.Println(err)
+    }
 }
 
-func (h *serverHandler) OnClose(id uint64) {
-}
+func (h *serverHandler) OnClose(id uint64) {}
 
 func main() {
-    server, _ := rpc.NewServer( nil)
+    server, _ := rpc.NewServer(&rpc.ServerOption{
+        ReadTimeout:  time.Second * 5,
+        WriteTimeout: time.Second * 5,
+    })
     server.AddPlugin(&serverHandler{})
     go func() {
         for {
             time.Sleep(time.Second)
-            n:=atomic.LoadUint32(&qps)
+            n := atomic.LoadUint32(&qps)
             atomic.StoreUint32(&qps, 0)
-            log.Println("qps:", n)
+            if n != 0 {
+                log.Println("qps:", n)
+            }
         }
     }()
     ln, _ := kcp.NewKCPListenerServe("127.0.0.1:12345", nil, nil)

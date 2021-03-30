@@ -1,6 +1,7 @@
 package rpc
 
 import (
+    "log"
     "net"
     "sync"
     "time"
@@ -10,17 +11,17 @@ type (
     Client struct {
         conn            net.Conn
         option          ClientOption
-        exitChan        chan bool
         requestManager  *RequestManager
         pluginContainer PluginContainer
         listM           sync.Mutex
         sendList        []*Message
         lastFlushSend   time.Time
+        openOnce        *sync.Once
+        sendCh          chan []byte
     }
     ClientOption struct {
-        ReadTimeout   time.Duration
-        WriteTimeout  time.Duration
-        FlushDuration time.Duration
+        ReadTimeout  time.Duration
+        WriteTimeout time.Duration
     }
 )
 
@@ -29,17 +30,16 @@ func NewClient(opt *ClientOption) (*Client, error) {
         opt = defaultClientOption()
     }
     cli := &Client{
-        exitChan:       make(chan bool),
         option:         *opt,
         requestManager: newRequestManager(),
+        openOnce:       &sync.Once{},
+        sendCh:         make(chan []byte, 10),
     }
     return cli, nil
 }
 
 func defaultClientOption() *ClientOption {
-    return &ClientOption{
-        //FlushDuration: time.Millisecond * 100,
-    }
+    return &ClientOption{}
 }
 func (s *Client) AddPlugin(p interface{}) {
     s.pluginContainer.Add(p)
@@ -47,136 +47,116 @@ func (s *Client) AddPlugin(p interface{}) {
 func (s *Client) RemovePlugin(p interface{}) {
     s.pluginContainer.Remove(p)
 }
-func (c *Client) DialAndServe(conn net.Conn) error {
+func (c *Client) Serve(conn net.Conn) error {
     c.conn = conn
-    c.pluginContainer.Range(func(i interface{}) {
-        if p, ok := i.(ClientOnOpenPlugin); ok {
-            p.OnOpen()
-        }
-    })
+    var wg sync.WaitGroup
     defer func() {
-        go close(c.exitChan)
+        _ = c.sendClose()
+        _ = conn.Close()
         c.pluginContainer.Range(func(i interface{}) {
             if p, ok := i.(ClientOnClosePlugin); ok {
                 p.OnClose()
             }
         })
-        _ = conn.Close()
     }()
-
-    for {
-        select {
-        case <-c.exitChan:
-            return nil
-        default:
-            if err := c.setReadTimeout(); err != nil {
-                return err
-            }
-            msg, err := readMessage(conn)
-            if err != nil {
-                return err
-            }
-            if msg != nil {
-                switch msg.Type {
-                case MessageTypeRequest, MessageTypeOneWay:
-                    // on message
-                    c.pluginContainer.Range(func(i interface{}) {
-                        if p, ok := i.(ClientOnMessagePlugin); ok {
-                            p.OnMessage(msg)
-                        }
-                    })
-                    FreeMessage(msg)
-                case MessageTypeResponse:
-                    // on reply
-                    c.OnReply(msg)
-                    FreeMessage(msg)
+    // send ping
+    err := c.sendKeepAlive()
+    if err != nil {
+        return err
+    }
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        for {
+            select {
+            case data := <-c.sendCh:
+                log.Println(data)
+                _, err = conn.Write(data)
+                if err != nil {
+                    return
                 }
             }
         }
-    }
+    }()
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := c.setReadTimeout(); err != nil {
+            return
+        }
+        var msg = NewMessage(c.sendCh)
+        if err := msg.Decode(conn); err != nil {
+            return
+        }
+        if err != nil {
+            return
+        }
+        c.openOnce.Do(func() {
+            c.pluginContainer.Range(func(i interface{}) {
+                if p, ok := i.(ClientOnOpenPlugin); ok {
+                    p.OnOpen()
+                }
+            })
+        })
+        switch msg.Type {
+        case MessageTypeRequest, MessageTypeOneWay:
+            // on message
+            c.pluginContainer.Range(func(i interface{}) {
+                if p, ok := i.(ClientOnMessagePlugin); ok {
+                    p.OnMessage(msg)
+                }
+            })
+        case MessageTypeResponse:
+            // on reply
+            c.requestManager.OnReply(msg)
+        }
+    }()
+    wg.Wait()
+    return nil
 }
-func (c *Client) OnReply(msg *Message) {
-    c.requestManager.OnReply(msg)
 
-}
 func (c *Client) Close() {
-    close(c.exitChan)
+    _ = c.conn.Close()
 }
 
-func (c *Client) Request(tag uint32, data []byte, cb func(*Message)) (err error) {
-    if c.conn == nil {
-        return ErrorConnectionInvalid
-    }
-
-    msg := NewMessage()
+func (c *Client) Request(data []byte, cb func(*Message)) (err error) {
+    msg := NewMessage(c.sendCh)
     msg.Type = MessageTypeRequest
     msg.requestId = c.requestManager.NextRequestId(cb)
-    msg.Tag = tag
     msg.Payload = data
     return c.postMessage(msg)
 }
 
-func (c *Client) flushSendList() error {
-    c.listM.Lock()
-
-    c.lastFlushSend = time.Now()
-    oldList := c.sendList
-    c.sendList = []*Message{}
-    c.listM.Unlock()
-
-    if err := c.setWriteTimeout(); err != nil {
-        return err
-    }
-    if _, err := writeMessage(c.conn, oldList...); err != nil {
-        return err
-    }
-    return nil
-}
-
-func (c *Client) Push(tag uint32, data []byte, cb func(*Message)) (err error) {
-    if c.conn == nil {
-        return ErrorConnectionInvalid
-    }
-    msg := NewMessage()
+func (c *Client) Push(data []byte) (err error) {
+    msg := NewMessage(c.sendCh)
     msg.Type = MessageTypeOneWay
     msg.requestId = 0
-    msg.Tag = tag
     msg.Payload = data
     return c.postMessage(msg)
 }
 
 func (c *Client) sendKeepAlive() error {
-    if c.conn == nil {
-        return nil
-    }
-
-    msg := NewMessage()
+    msg := NewMessage(c.sendCh)
     msg.Type = MessageTypeKeep
+    return c.postMessage(msg)
+}
+func (c *Client) sendClose() error {
+    msg := NewMessage(c.sendCh)
+    msg.Type = MessageTypeClose
     return c.postMessage(msg)
 }
 
 func (c *Client) Reconnect(second time.Duration) {
     time.AfterFunc(second, func() {
-        //c.DialAndServe(c.address, c.password, c.salt)
+        //c.Serve(c.address, c.password, c.salt)
     })
 }
 func (c *Client) postMessage(msg *Message) error {
-    if c.option.FlushDuration == 0 {
-        if err := c.setWriteTimeout(); err != nil {
-            return err
-        }
-        _, err := writeMessage(c.conn, msg)
+    if err := c.setWriteTimeout(); err != nil {
         return err
     }
-
-    c.listM.Lock()
-    c.sendList = append(c.sendList, msg)
-    c.listM.Unlock()
-    if time.Now().Sub(c.lastFlushSend) >= c.option.FlushDuration {
-        return c.flushSendList()
-    }
+    msg.Emit()
     return nil
-
 }
 func (c *Client) setReadTimeout() error {
     if c.option.ReadTimeout == 0 {
