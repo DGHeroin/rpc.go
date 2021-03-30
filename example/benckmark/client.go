@@ -74,7 +74,7 @@ func runClient() {
             }
         }
     }()
-    conn, _ := kcp.NewKCPDialer("127.0.0.1:12345", nil, nil)
+    conn, _ := kcp.NewKCPDialer("127.0.0.1:12345", []byte("1234"), []byte("1234"))
     if err := cli.Serve(conn); err != nil {
         log.Println("初始化出错", err)
         return

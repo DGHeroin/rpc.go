@@ -95,58 +95,63 @@ func (s *Server) handleConn(conn net.Conn) {
         msg *Message
         wg  sync.WaitGroup
     )
+    exitCh := make(chan bool)
     id, sendCh := s.addClient()
-    log.Printf("conn liv|%p", conn)
     defer func() {
-        log.Printf("conn die|%p", conn)
         s.removeClient(id)
     }()
     wg.Add(1)
     go func() {
         defer func() {
-            log.Println("write end")
             wg.Done()
             _ = conn.Close()
         }()
         for {
-            data := <-sendCh
-            if data == nil {
+            select {
+            case <-exitCh:
                 return
+            case data := <-sendCh:
+                if data == nil {
+                    return
+                }
+                if err = s.setWriteTimeout(conn); err != nil {
+                    return
+                }
+                _, err = conn.Write(data)
+                if err != nil {
+                    return
+                }
             }
-            if err = s.setWriteTimeout(conn); err != nil {
-                return
-            }
-            log.Println("服务器send", data)
-            _, err = conn.Write(data)
-            if err != nil {
-                return
-            }
-
         }
     }()
     wg.Add(1)
     go func() {
         defer func() {
-            log.Println("read end")
             wg.Done()
             sendCh <- nil
             close(sendCh)
+            close(exitCh)
         }()
         for {
-            if err = s.setReadTimeout(conn); err != nil {
-                log.Println(err)
+            select {
+            case <-exitCh:
                 return
-            }
-            msg = NewMessage(sendCh)
-            err = msg.Decode(conn)
-            if err != nil {
-                log.Println(err)
-                return
-            }
-            err = s.handleMessage(id, msg)
-            if err != nil {
-                log.Println(err)
-                return
+            default:
+                if err = s.setReadTimeout(conn); err != nil {
+                    log.Println(err)
+                    return
+                }
+                msg = NewMessage(sendCh)
+                err = msg.Decode(conn)
+                if err != nil {
+                    log.Println(err)
+                    return
+                }
+                err = s.handleMessage(id, msg)
+                if err != nil {
+                    log.Println(err)
+                    return
+                }
             }
         }
     }()
@@ -171,7 +176,6 @@ func (s *Server) handleMessage(id uint64, msg *Message) error {
     case MessageTypeKeep:
         return s.sendKeepAlive(id)
     default:
-        log.Println(">>>", msg)
         return ErrorMessageTypeInvalid
     }
     return nil

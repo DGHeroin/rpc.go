@@ -1,7 +1,6 @@
 package rpc
 
 import (
-    "log"
     "net"
     "sync"
     "time"
@@ -70,7 +69,6 @@ func (c *Client) Serve(conn net.Conn) error {
         for {
             select {
             case data := <-c.sendCh:
-                log.Println(data)
                 _, err = conn.Write(data)
                 if err != nil {
                     return
@@ -81,34 +79,36 @@ func (c *Client) Serve(conn net.Conn) error {
     wg.Add(1)
     go func() {
         defer wg.Done()
-        if err := c.setReadTimeout(); err != nil {
-            return
-        }
-        var msg = NewMessage(c.sendCh)
-        if err := msg.Decode(conn); err != nil {
-            return
-        }
-        if err != nil {
-            return
-        }
-        c.openOnce.Do(func() {
-            c.pluginContainer.Range(func(i interface{}) {
-                if p, ok := i.(ClientOnOpenPlugin); ok {
-                    p.OnOpen()
-                }
+        for {
+            if err := c.setReadTimeout(); err != nil {
+                return
+            }
+            var msg = NewMessage(c.sendCh)
+            if err := msg.Decode(conn); err != nil {
+                return
+            }
+            if err != nil {
+                return
+            }
+            c.openOnce.Do(func() {
+                c.pluginContainer.Range(func(i interface{}) {
+                    if p, ok := i.(ClientOnOpenPlugin); ok {
+                        p.OnOpen()
+                    }
+                })
             })
-        })
-        switch msg.Type {
-        case MessageTypeRequest, MessageTypeOneWay:
-            // on message
-            c.pluginContainer.Range(func(i interface{}) {
-                if p, ok := i.(ClientOnMessagePlugin); ok {
-                    p.OnMessage(msg)
-                }
-            })
-        case MessageTypeResponse:
-            // on reply
-            c.requestManager.OnReply(msg)
+            switch msg.Type {
+            case MessageTypeRequest, MessageTypeOneWay:
+                // on message
+                c.pluginContainer.Range(func(i interface{}) {
+                    if p, ok := i.(ClientOnMessagePlugin); ok {
+                        p.OnMessage(msg)
+                    }
+                })
+            case MessageTypeResponse:
+                // on reply
+                c.requestManager.OnReply(msg)
+            }
         }
     }()
     wg.Wait()

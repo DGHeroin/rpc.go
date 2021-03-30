@@ -5,7 +5,6 @@ import (
     "encoding/binary"
     "errors"
     "io"
-    "log"
 )
 
 var (
@@ -54,13 +53,11 @@ func (m *Message) Reply(payload []byte) error {
 
 func (m *Message) Emit() {
     bin := m.Encode()
-    log.Println("emit", bin)
     m.SendCh <- bin
 }
 
 func readFull(r io.Reader, data []byte) (int, error) {
     n, err := io.ReadFull(r, data)
-    log.Println(n, data)
     return n, err
 }
 
@@ -90,7 +87,7 @@ func (m *Message) Decode(conn io.ReadWriteCloser) error {
             return err
         }
     }
-log.Println("size================>", size)
+
     // payload
     payload := make([]byte, size)
     _, err = readFull(conn, payload)

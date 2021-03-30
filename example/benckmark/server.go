@@ -46,7 +46,7 @@ func main() {
             }
         }
     }()
-    ln, _ := kcp.NewKCPListenerServe("127.0.0.1:12345", nil, nil)
+    ln, _ := kcp.NewKCPListenerServe("127.0.0.1:12345", []byte("1234"), []byte("1234"))
     if err := server.Serve(ln); err != nil {
         log.Println(err)
     }
