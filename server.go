@@ -129,6 +129,7 @@ func (s *Server) handleConn(conn net.Conn) {
         defer func() {
             wg.Done()
             sendCh <- nil
+            _ = conn.Close()
             close(sendCh)
             close(exitCh)
         }()

@@ -31,6 +31,7 @@ func (h *serverHandler) OnMessage(id uint64, message *rpc.Message) {
 func (h *serverHandler) OnClose(id uint64) {}
 
 func main() {
+    log.SetFlags(log.LstdFlags | log.Lshortfile)
     server, _ := rpc.NewServer(&rpc.ServerOption{
         ReadTimeout:  time.Second * 5,
         WriteTimeout: time.Second * 5,

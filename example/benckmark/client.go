@@ -12,6 +12,7 @@ import (
 )
 
 func main() {
+    log.SetFlags(log.LstdFlags | log.Lshortfile)
     for i := 0; i < 1; i++ {
         go runClient()
     }
@@ -53,7 +54,7 @@ func runClient() {
                 data := make([]byte, 4)
                 binary.BigEndian.PutUint32(data, n)
                 err := cli.Request(data, func(message *rpc.Message) {
-                    fmt.Println("收到回复:", message.Payload)
+                   // fmt.Println("收到回复:", message.Payload)
                 })
                 if err != nil {
                     log.Println("err", err)

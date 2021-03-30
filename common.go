@@ -80,7 +80,8 @@ func (m *Message) Decode(conn io.ReadWriteCloser) error {
     if err != nil {
         return err
     }
-    if msgType == MessageTypeRequest {
+    switch m.Type {
+    case MessageTypeRequest, MessageTypeResponse:
         // request id
         m.requestId, err = readUInt32(conn)
         if err != nil {

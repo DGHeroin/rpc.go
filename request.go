@@ -1,6 +1,9 @@
 package rpc
 
-import "sync"
+import (
+    "log"
+    "sync"
+)
 
 type RequestManager struct {
     mutex      sync.Mutex
@@ -14,6 +17,7 @@ func (m *RequestManager) OnReply(msg *Message) {
     cb, ok := m.requestMap[id]
     m.mutex.Unlock()
     if !ok {
+        log.Println("不存在", id)
         return
     }
     cb(msg)
