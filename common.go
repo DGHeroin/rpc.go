@@ -10,7 +10,6 @@ import (
 var (
     ErrorMessageFormatInvalid = errors.New("message format invalid")
     ErrorMessageTypeInvalid   = errors.New("message type invalid")
-    ErrorConnectIdInvalid     = errors.New("connect id invalid")
     ErrorConnectionInvalid    = errors.New("connection invalid")
 )
 
@@ -29,7 +28,7 @@ type (
         Type      MessageType
         Payload   []byte
         requestId uint32
-        SendCh      chan []byte
+        SendCh    chan []byte
     }
 )
 
@@ -62,21 +61,22 @@ func readFull(r io.Reader, data []byte) (int, error) {
 }
 
 func (m *Message) Decode(conn io.ReadWriteCloser) error {
-    var err error
+    var (
+        err  error
+        size uint32
+    )
+
     // read header
     header := make([]byte, 1)
-    if _, err := readFull(conn, header); err != nil {
+    if _, err = readFull(conn, header); err != nil {
         return err
     }
-    msgType := MessageType(header[0])
-    if msgType == MessageTypeKeep {
-        m.Type = msgType
+    m.Type = MessageType(header[0])
+    if m.Type == MessageTypeKeep {
         return nil
     }
-    // msg type
-    m.Type = msgType
     // size
-    size, err := readUInt32(conn)
+    size, err = readUInt32(conn)
     if err != nil {
         return err
     }
@@ -88,14 +88,12 @@ func (m *Message) Decode(conn io.ReadWriteCloser) error {
             return err
         }
     }
-
     // payload
-    payload := make([]byte, size)
-    _, err = readFull(conn, payload)
+    m.Payload = make([]byte, size)
+    _, err = readFull(conn, m.Payload)
     if err != nil {
         return err
     }
-    m.Payload = payload
     return nil
 }
 
