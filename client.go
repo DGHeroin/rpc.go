@@ -40,11 +40,11 @@ func NewClient(opt *ClientOption) (*Client, error) {
 func defaultClientOption() *ClientOption {
     return &ClientOption{}
 }
-func (s *Client) AddPlugin(p interface{}) {
-    s.pluginContainer.Add(p)
+func (c *Client) AddPlugin(p interface{}) {
+    c.pluginContainer.Add(p)
 }
-func (s *Client) RemovePlugin(p interface{}) {
-    s.pluginContainer.Remove(p)
+func (c *Client) RemovePlugin(p interface{}) {
+    c.pluginContainer.Remove(p)
 }
 func (c *Client) Serve(conn net.Conn) error {
     c.conn = conn
