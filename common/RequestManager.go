@@ -1,4 +1,4 @@
-package rpc
+package common
 
 import (
     "log"
@@ -12,7 +12,7 @@ type RequestManager struct {
 }
 
 func (m *RequestManager) OnReply(msg *Message) {
-    id := msg.requestId
+    id := msg.RequestId
     m.mutex.Lock()
     cb, ok := m.requestMap[id]
     m.mutex.Unlock()
@@ -40,7 +40,7 @@ func (c *RequestManager) NextRequestId(cb func(*Message)) uint32 {
         c.requestId++
     }
 }
-func newRequestManager() *RequestManager {
+func NewRequestManager() *RequestManager {
     return &RequestManager{
         requestId:  0,
         requestMap: map[uint32]func(*Message){},

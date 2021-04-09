@@ -1,4 +1,4 @@
-package rpc
+package common
 
 // server side
 type (

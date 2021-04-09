@@ -1,6 +1,7 @@
 package main
 
 import (
+    "github.com/DGHeroin/rpc.go/common"
     "github.com/DGHeroin/rpc.go/kcp"
     "log"
     "sync/atomic"
@@ -20,7 +21,7 @@ func (h *serverHandler) OnAccept(id uint64) {
 
 }
 
-func (h *serverHandler) OnMessage(id uint64, message *rpc.Message) {
+func (h *serverHandler) OnMessage(id uint64, message *common.Message) {
     atomic.AddUint32(&qps, 1)
     err := message.Reply(message.Payload)
     if err != nil {

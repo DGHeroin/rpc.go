@@ -1,6 +1,8 @@
 package rpc
 
 import (
+    "bufio"
+    "github.com/DGHeroin/rpc.go/common"
     "log"
     "net"
     "sync"
@@ -13,9 +15,9 @@ type (
         mutex           sync.RWMutex
         clientId        uint64
         sessions        map[uint64]chan []byte
-        requestManager  *RequestManager
+        requestManager  *common.RequestManager
         option          ServerOption
-        pluginContainer PluginContainer
+        pluginContainer common.PluginContainer
         exitChan        chan bool
     }
     ServerOption struct {
@@ -31,7 +33,7 @@ func NewServer(opt *ServerOption) (*Server, error) {
     }
     s := &Server{
         option:         *opt,
-        requestManager: newRequestManager(),
+        requestManager: common.NewRequestManager(),
         exitChan:       make(chan bool),
     }
     s.sessions = make(map[uint64]chan []byte)
@@ -68,7 +70,7 @@ func (s *Server) addClient() (uint64, chan []byte) {
             ch := make(chan []byte)
             s.sessions[id] = ch
             s.pluginContainer.Range(func(i interface{}) {
-                if p, ok2 := i.(ServerOnAcceptPlugin); ok2 {
+                if p, ok2 := i.(common.ServerOnAcceptPlugin); ok2 {
                     p.OnAccept(id)
                 }
             })
@@ -83,7 +85,7 @@ func (s *Server) removeClient(id uint64) {
     if _, ok := s.sessions[id]; ok {
         delete(s.sessions, id)
         s.pluginContainer.Range(func(i interface{}) {
-            if p, ok2 := i.(ServerOnClosePlugin); ok2 {
+            if p, ok2 := i.(common.ServerOnClosePlugin); ok2 {
                 p.OnClose(id)
             }
         })
@@ -92,9 +94,11 @@ func (s *Server) removeClient(id uint64) {
 func (s *Server) handleConn(conn net.Conn) {
     var (
         err error
-        msg *Message
+        msg *common.Message
         wg  sync.WaitGroup
+        r *bufio.Reader
     )
+    r = bufio.NewReaderSize(conn, 16*1024)
     exitCh := make(chan bool)
     id, sendCh := s.addClient()
     defer func() {
@@ -142,8 +146,8 @@ func (s *Server) handleConn(conn net.Conn) {
                     log.Println(err)
                     return
                 }
-                msg = NewMessage(sendCh)
-                err = msg.Decode(conn)
+                msg = common.NewMessage(sendCh)
+                err = msg.Decode(r)
                 if err != nil {
                     log.Println(err)
                     return
@@ -158,26 +162,26 @@ func (s *Server) handleConn(conn net.Conn) {
     }()
     wg.Wait()
 }
-func (s *Server) handleMessage(id uint64, msg *Message) error {
+func (s *Server) handleMessage(id uint64, msg *common.Message) error {
     if msg == nil {
         return nil
     }
     switch msg.Type {
-    case MessageTypeRequest, MessageTypeOneWay:
+    case common.MessageTypeRequest, common.MessageTypeOneWay:
         // on message
         s.pluginContainer.Range(func(i interface{}) {
-            if p, ok := i.(ServerOnMessagePlugin); ok {
+            if p, ok := i.(common.ServerOnMessagePlugin); ok {
                 p.OnMessage(id, msg)
             }
         })
-    case MessageTypeResponse:
+    case common.MessageTypeResponse:
         // on reply
         s.requestManager.OnReply(msg)
         return nil
-    case MessageTypeKeep:
+    case common.MessageTypeKeep:
         return s.sendKeepAlive(id)
     default:
-        return ErrorMessageTypeInvalid
+        return common.ErrorMessageTypeInvalid
     }
     return nil
 }
@@ -185,10 +189,10 @@ func (s *Server) handleMessage(id uint64, msg *Message) error {
 func (s *Server) sendKeepAlive(id uint64) error {
     ch := s.getSendChannel(id)
     if ch == nil {
-        return ErrorConnectionInvalid
+        return common.ErrorConnectionInvalid
     }
-    msg := NewMessage(ch)
-    msg.Type = MessageTypeKeep
+    msg := common.NewMessage(ch)
+    msg.Type = common.MessageTypeKeep
     msg.Emit()
     return nil
 }
@@ -201,15 +205,15 @@ func (s *Server) getSendChannel(id uint64) chan []byte {
     }
     return nil
 }
-func (s *Server) Request(id uint64, tag uint32, data []byte, cb func(*Message)) (n int, err error) {
+func (s *Server) Request(id uint64, tag uint32, data []byte, cb func(*common.Message)) (n int, err error) {
     ch := s.getSendChannel(id)
     if ch == nil {
-        return 0, ErrorConnectionInvalid
+        return 0, common.ErrorConnectionInvalid
     }
 
-    msg := NewMessage(ch)
-    msg.Type = MessageTypeRequest
-    msg.requestId = s.requestManager.NextRequestId(cb)
+    msg := common.NewMessage(ch)
+    msg.Type = common.MessageTypeRequest
+    msg.RequestId = s.requestManager.NextRequestId(cb)
     msg.Payload = data
     msg.Emit()
 
@@ -219,11 +223,11 @@ func (s *Server) Request(id uint64, tag uint32, data []byte, cb func(*Message)) 
 func (s *Server) Push(id uint64, tag uint32, data []byte) (n int, err error) {
     ch := s.getSendChannel(id)
     if ch == nil {
-        return 0, ErrorConnectionInvalid
+        return 0, common.ErrorConnectionInvalid
     }
-    msg := NewMessage(ch)
-    msg.Type = MessageTypeOneWay
-    msg.requestId = 0
+    msg := common.NewMessage(ch)
+    msg.Type = common.MessageTypeOneWay
+    msg.RequestId = 0
     msg.Payload = data
 
     msg.Emit()

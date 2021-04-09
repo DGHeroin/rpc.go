@@ -1,6 +1,7 @@
-package rpc
+package common
 
 import (
+    "bufio"
     "bytes"
     "encoding/binary"
     "errors"
@@ -25,9 +26,9 @@ const (
 
 type (
     Message struct {
-        Type      MessageType
+        Type    MessageType
         Payload   []byte
-        requestId uint32
+        RequestId uint32
         SendCh    chan []byte
     }
 )
@@ -45,7 +46,7 @@ func (m *Message) Reply(payload []byte) error {
     msg := NewMessage(m.SendCh)
     msg.Payload = payload
     msg.Type = MessageTypeResponse
-    msg.requestId = m.requestId
+    msg.RequestId = m.RequestId
     msg.Emit()
     return nil
 }
@@ -60,7 +61,7 @@ func readFull(r io.Reader, data []byte) (int, error) {
     return n, err
 }
 
-func (m *Message) Decode(conn io.ReadWriteCloser) error {
+func (m *Message) Decode(conn *bufio.Reader) error {
     var (
         err  error
         size uint32
@@ -83,7 +84,7 @@ func (m *Message) Decode(conn io.ReadWriteCloser) error {
     switch m.Type {
     case MessageTypeRequest, MessageTypeResponse:
         // request id
-        m.requestId, err = readUInt32(conn)
+        m.RequestId, err = readUInt32(conn)
         if err != nil {
             return err
         }
@@ -106,7 +107,7 @@ func (m *Message) Encode() []byte {
     writeUInt32(uint32(len(m.Payload)), buffer) // size  4
     switch m.Type {
     case MessageTypeRequest, MessageTypeResponse:
-        writeUInt32(m.requestId, buffer) // request id 4
+        writeUInt32(m.RequestId, buffer) // request id 4
     }
     buffer.Write(m.Payload)
     return buffer.Bytes()

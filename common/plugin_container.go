@@ -1,4 +1,4 @@
-package rpc
+package common
 
 type PluginContainer struct {
     plugins []interface{}

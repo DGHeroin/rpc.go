@@ -2,7 +2,7 @@ package client
 
 import (
     "context"
-    "github.com/DGHeroin/rpc.go"
+    "github.com/DGHeroin/rpc.go/common"
     "golang.org/x/sync/singleflight"
     "log"
     "strings"
@@ -21,8 +21,9 @@ type (
     xClient struct {
         servicePath  string
         selector     Selector
-        Plugins      rpc.PluginContainer
+        Plugins      common.PluginContainer
         cachedClient map[string]RPCClient
+        sfGroup      singleflight.Group
     }
 )
 
@@ -53,17 +54,24 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 
 func (c *xClient) selectClient(ctx context.Context, serviceMethod string, args interface{}) (string, RPCClient, error) {
     var (
-    	ok bool
+        ok     bool
         client RPCClient
     )
     selectedAddr := c.selector.Select(ctx, c.servicePath, serviceMethod, args)
     client, ok = c.cachedClient[selectedAddr]
     if !ok {
         network, addr := splitNetworkAndAddress(selectedAddr)
+        log.Println(network, addr)
+        c.sfGroup.Do(selectedAddr, func() (interface{}, error) {
+            return c.connectTo(network, addr)
+        })
     }
-    var sg  singleflight.Group{}
-    sg.
+
     return selectedAddr, client, nil
+}
+
+func (c *xClient) connectTo(network string, addr string) (RPCClient, error) {
+    return nil, nil
 }
 func splitNetworkAndAddress(server string) (string, string) {
     ss := strings.SplitN(server, "@", 2)
